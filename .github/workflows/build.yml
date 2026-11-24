@@ -1,0 +1,360 @@
+name: Super-Universal APK Builder
+
+on:
+  push:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Unzip & Auto-Detect Project Type
+        id: detect
+        shell: bash
+        run: |
+          mkdir -p src_project
+          unzip -q -o project.zip -d src_project
+          rm -rf src_project/__MACOSX
+
+          if [ ! -f src_project/pubspec.yaml ] && [ ! -f src_project/package.json ] && [ ! -f src_project/gradlew ] && [ ! -f src_project/settings.gradle ] && [ ! -f src_project/settings.gradle.kts ] && [ ! -f src_project/build.gradle ] && [ ! -f src_project/build.gradle.kts ] && [ ! -f src_project/index.html ]; then
+            ROOT_MARKER=$(find src_project -maxdepth 4 \( -name "pubspec.yaml" -o -name "package.json" -o -name "gradlew" -o -name "settings.gradle" -o -name "settings.gradle.kts" -o -name "build.gradle" -o -name "build.gradle.kts" -o -name "index.html" \) -print | awk '{ print gsub("/","/"), $0 }' | sort -n | head -n 1 | cut -d' ' -f2-)
+            if [ -n "$ROOT_MARKER" ]; then
+              SUBDIR=$(dirname "$ROOT_MARKER")
+              if [ "$SUBDIR" != "src_project" ]; then
+                shopt -s dotglob nullglob
+                mv "$SUBDIR"/* src_project/ 2>/dev/null || true
+              fi
+            fi
+          fi
+
+          if [ -f firebase-config.json ]; then
+            python3 - << 'PYEOF'
+          import json, os, re, shutil
+
+          with open("firebase-config.json", "r", encoding="utf-8") as f:
+              cfg = json.load(f)
+
+          pkg_name = ""
+          clients = cfg.get("client", [])
+          if clients:
+              pkg_name = clients[0].get("client_info", {}).get("android_client_info", {}).get("package_name", "")
+
+          app_dir = "src_project/app"
+          if not os.path.isdir(app_dir) and os.path.isdir("src_project/android/app"):
+              app_dir = "src_project/android/app"
+          elif not os.path.isdir(app_dir):
+              os.makedirs(app_dir, exist_ok=True)
+
+          shutil.copyfile("firebase-config.json", os.path.join(app_dir, "google-services.json"))
+          print(f"Copied firebase-config.json -> {app_dir}/google-services.json")
+
+          if pkg_name:
+              for gradle_name in ("build.gradle.kts", "build.gradle"):
+                  gpath = os.path.join(app_dir, gradle_name)
+                  if os.path.isfile(gpath):
+                      with open(gpath, "r", encoding="utf-8") as gf:
+                          content = gf.read()
+                      old_ns_m = re.search(r'namespace\s*(?:=|\s)\s*["\']([^"\']+)["\']', content)
+                      old_ns = old_ns_m.group(1) if old_ns_m else ""
+                      content = re.sub(r'(applicationId\s*(?:=|\s)\s*["\'])[^"\']+(["\'])', rf'\g<1>{pkg_name}\g<2>', content)
+                      content = re.sub(r'(namespace\s*(?:=|\s)\s*["\'])[^"\']+(["\'])', rf'\g<1>{pkg_name}\g<2>', content)
+                      with open(gpath, "w", encoding="utf-8") as gf:
+                          gf.write(content)
+                      print(f"Updated {gpath} applicationId & namespace -> {pkg_name}")
+
+                      if old_ns and old_ns != pkg_name:
+                          manifest_path = os.path.join(app_dir, "src/main/AndroidManifest.xml")
+                          if os.path.isfile(manifest_path):
+                              with open(manifest_path, "r", encoding="utf-8") as mf:
+                                  mcontent = mf.read()
+                              mcontent = re.sub(r'(android:name\s*=\s*["\'])\.([A-Za-z0-9_.]+["\'])', rf'\g<1>{old_ns}.\g<2>', mcontent)
+                              with open(manifest_path, "w", encoding="utf-8") as mf:
+                                  mf.write(mcontent)
+                          java_root = os.path.join(app_dir, "src/main")
+                          for root_dir, _, files in os.walk(java_root):
+                              for fname in files:
+                                  if fname.endswith((".kt", ".java")):
+                                      fpath = os.path.join(root_dir, fname)
+                                      with open(fpath, "r", encoding="utf-8", errors="ignore") as sf:
+                                          src = sf.read()
+                                      changed = False
+                                      if f"{old_ns}.R" in src:
+                                          src = src.replace(f"{old_ns}.R", f"{pkg_name}.R")
+                                          changed = True
+                                      if f"{old_ns}.BuildConfig" in src:
+                                          src = src.replace(f"{old_ns}.BuildConfig", f"{pkg_name}.BuildConfig")
+                                          changed = True
+                                      if re.search(rf'^\s*package\s+{re.escape(old_ns)}\b', src, re.MULTILINE):
+                                          semi = ";" if fname.endswith(".java") else ""
+                                          if re.search(r'\bR\.', src) and f"{pkg_name}.R" not in src:
+                                              src = re.sub(r'(^\s*package\s+[^\n]+)', rf'\1\nimport {pkg_name}.R{semi}', src, count=1, flags=re.MULTILINE)
+                                              changed = True
+                                          if re.search(r'\bBuildConfig\.', src) and f"{pkg_name}.BuildConfig" not in src:
+                                              src = re.sub(r'(^\s*package\s+[^\n]+)', rf'\1\nimport {pkg_name}.BuildConfig{semi}', src, count=1, flags=re.MULTILINE)
+                                              changed = True
+                                      if changed:
+                                          with open(fpath, "w", encoding="utf-8") as sf:
+                                              sf.write(src)
+          PYEOF
+          fi
+
+          PROJECT_TYPE="web"
+          GRADLE_VERSION="9.3.1"
+
+          if [ -f src_project/pubspec.yaml ]; then
+            PROJECT_TYPE="flutter"
+          elif [ -f src_project/package.json ]; then
+            PROJECT_TYPE="react_native"
+          elif [ -f src_project/build.gradle ] || [ -f src_project/build.gradle.kts ] || [ -f src_project/settings.gradle ] || [ -f src_project/settings.gradle.kts ] || [ -f src_project/gradlew ]; then
+            PROJECT_TYPE="android"
+            if [ -f src_project/gradle/wrapper/gradle-wrapper.properties ]; then
+              PARSED_VER=$(grep -E '^distributionUrl=' src_project/gradle/wrapper/gradle-wrapper.properties | sed -E 's/.*gradle-([0-9]+\.[0-9]+(\.[0-9]+)?)-.*/\1/' | tr -d '\r\n ')
+              if [ -n "$PARSED_VER" ]; then
+                GRADLE_VERSION="$PARSED_VER"
+              fi
+            fi
+          elif [ -f src_project/index.html ] || find src_project -maxdepth 2 -iname "*.html" | grep -q .; then
+            PROJECT_TYPE="web"
+          fi
+
+          echo "type=$PROJECT_TYPE" >> "$GITHUB_OUTPUT"
+          echo "gradle_version=$GRADLE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected project type: $PROJECT_TYPE (Gradle: $GRADLE_VERSION)"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      # A) Native Android
+      - name: Set up Gradle (Native Android)
+        if: steps.detect.outputs.type == 'android'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.detect.outputs.gradle_version }}
+
+      - name: Build Native Android APK
+        if: steps.detect.outputs.type == 'android'
+        working-directory: src_project
+        shell: bash
+        run: |
+          if [ -f ./gradlew ]; then
+            chmod +x gradlew
+            ./gradlew assembleDebug --no-daemon
+          else
+            gradle assembleDebug --no-daemon
+          fi
+
+      # B) Flutter
+      - name: Set up Flutter
+        if: steps.detect.outputs.type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Build Flutter APK
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: src_project
+        shell: bash
+        run: |
+          flutter pub get
+          flutter build apk --debug
+
+      # C) React Native / Expo
+      - name: Set up Node.js
+        if: steps.detect.outputs.type == 'react_native'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build React Native / Expo APK
+        if: steps.detect.outputs.type == 'react_native'
+        working-directory: src_project
+        shell: bash
+        run: |
+          npm install --legacy-peer-deps || npm install
+          if [ ! -d android ]; then
+            CI=1 npx --yes expo prebuild --platform android --non-interactive
+          fi
+          if [ -f ../firebase-config.json ] && [ -d android/app ]; then
+            cp ../firebase-config.json android/app/google-services.json
+            python3 - << 'PYEOF'
+          import json, os, re
+          with open("../firebase-config.json", "r", encoding="utf-8") as f:
+              cfg = json.load(f)
+          clients = cfg.get("client", [])
+          pkg_name = clients[0].get("client_info", {}).get("android_client_info", {}).get("package_name", "") if clients else ""
+          if pkg_name:
+              for gradle_name in ("build.gradle.kts", "build.gradle"):
+                  gpath = os.path.join("android/app", gradle_name)
+                  if os.path.isfile(gpath):
+                      with open(gpath, "r", encoding="utf-8") as gf:
+                          c = gf.read()
+                      c = re.sub(r'(applicationId\s*(?:=|\s)\s*["\'])[^"\']+(["\'])', rf'\g<1>{pkg_name}\g<2>', c)
+                      c = re.sub(r'(namespace\s*(?:=|\s)\s*["\'])[^"\']+(["\'])', rf'\g<1>{pkg_name}\g<2>', c)
+                      with open(gpath, "w", encoding="utf-8") as gf:
+                          gf.write(c)
+          PYEOF
+          fi
+          cd android
+          if [ -f ./gradlew ]; then
+            chmod +x gradlew
+            ./gradlew assembleDebug --no-daemon
+          else
+            gradle assembleDebug --no-daemon
+          fi
+
+      # D) Plain Web (HTML/CSS/JS) -> Android WebView Wrapper
+      - name: Set up Gradle (WebView Wrapper)
+        if: steps.detect.outputs.type == 'web'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build WebView APK
+        if: steps.detect.outputs.type == 'web'
+        shell: bash
+        run: |
+          mkdir -p web_wrapper/app/src/main/java/com/webapp/wrapper
+          mkdir -p web_wrapper/app/src/main/assets
+          cp -r src_project/* web_wrapper/app/src/main/assets/
+
+          cat << 'EOF' > web_wrapper/settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "WebAppWrapper"
+          include ':app'
+          EOF
+
+          cat << 'EOF' > web_wrapper/build.gradle
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          EOF
+
+          cat << 'EOF' > web_wrapper/app/build.gradle
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.webapp.wrapper'
+              compileSdk 35
+              defaultConfig {
+                  applicationId "com.webapp.wrapper.app"
+                  minSdk 24
+                  targetSdk 35
+                  versionCode 1
+                  versionName "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
+
+          cat << 'EOF' > web_wrapper/app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="Web App"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > web_wrapper/app/src/main/java/com/webapp/wrapper/MainActivity.java
+          package com.webapp.wrapper;
+
+          import android.annotation.SuppressLint;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          public class MainActivity extends Activity {
+              private WebView webView;
+
+              @SuppressLint("SetJavaScriptEnabled")
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  webView = new WebView(this);
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setAllowFileAccess(true);
+                  settings.setAllowContentAccess(true);
+                  settings.setDatabaseEnabled(true);
+                  webView.setWebViewClient(new WebViewClient());
+                  webView.setWebChromeClient(new WebChromeClient());
+                  setContentView(webView);
+                  webView.loadUrl("file:///android_asset/index.html");
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webView != null && webView.canGoBack()) {
+                      webView.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+          }
+          EOF
+
+          cd web_wrapper
+          gradle assembleDebug --no-daemon
+
+      # Final output: find any *-debug.apk and upload as 'tayyor-apk'
+      - name: Locate built Debug APK
+        id: find_apk
+        shell: bash
+        run: |
+          APK_PATH=$(find . -name "*-debug.apk" | head -n 1)
+          if [ -z "$APK_PATH" ]; then
+            APK_PATH=$(find . -name "*.apk" | head -n 1)
+          fi
+          if [ -z "$APK_PATH" ]; then
+            echo "Error: APK fayl topilmadi!"
+            exit 1
+          fi
+          echo "Found APK: $APK_PATH"
+          echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tayyor-apk
+          path: ${{ steps.find_apk.outputs.apk_path }}
+          if-no-files-found: error
